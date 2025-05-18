@@ -5,6 +5,9 @@ import { userModel } from "../db/user";
 import jwt from "jsonwebtoken";
 import { checkAuth } from "../middleware/user";
 import { contentModel } from "../db/content";
+import { genearteEmbeddings, textToTextHandler } from "../utils/cohere";
+import { transcribeYoutube } from "../utils/transcribe";
+import { createCollection, searchSimilar, upsertPoints } from "../utils/qdrant";
 const router = Router();
 
 router.post("/signup", async (req, res) => {
@@ -155,10 +158,36 @@ router.post("/add-content", checkAuth, async (req, res) => {
     tags,
     userId: user._id,
   });
-  console.log(data);
-  // const content = await contentModel.find({ userId: user._id });
 
-  res.json(data);
+  // doing vector databases related work here
+  try {
+    if (data.type === "video") {
+      // RAG pipeline here
+      const videoUrl = data.link.replace("embed/", "watch?v=");
+      const chunks = await transcribeYoutube(videoUrl);
+      const textChunks = chunks.map((chunk) => chunk.text);
+      const embeddings = await genearteEmbeddings(textChunks);
+      const vectors: number[][] = embeddings.float!;
+
+      await createCollection("brainly_collection");
+
+      // upsert points here
+      const upserted = await upsertPoints(
+        "brainly_collection",
+        chunks,
+        vectors
+      );
+
+      res.json({
+        data,
+        chunks,
+        vectors,
+        upserted,
+      });
+    }
+  } catch (error) {
+    console.error("Error accured while creating chunks", error);
+  }
 });
 
 router.delete("/delete-content/:id", checkAuth, async (req, res) => {
@@ -170,7 +199,20 @@ router.delete("/delete-content/:id", checkAuth, async (req, res) => {
 
 router.post("/search", checkAuth, async (req, res) => {
   const { prompt } = req.body;
-  res.json(prompt);
+  const embeddings = await genearteEmbeddings([prompt]);
+
+  const result = await searchSimilar("brainly_collection", prompt);
+  if (!result.points || result.points.length === 0) {
+    res.json({ msg: "No results found" });
+    return;
+  } else if (result.points.length > 0) {
+    const answer = await textToTextHandler(
+      `Answer the question based on the context: ${prompt} Context: ${
+        result.points[0].payload!.text
+      }`
+    );
+    res.json({ result, answer });
+  }
 });
 
 export const userRouter = router;
